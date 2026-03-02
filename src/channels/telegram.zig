@@ -602,9 +602,101 @@ pub const TelegramChannel = struct {
         return std.mem.indexOf(u8, resp, "\"ok\":true") != null;
     }
 
+    const Utf16ByteRange = struct {
+        start: usize,
+        end: usize,
+    };
+
+    fn utf16RangeToByteRange(text: []const u8, utf16_offset: usize, utf16_length: usize) ?Utf16ByteRange {
+        const utf16_end = std.math.add(usize, utf16_offset, utf16_length) catch return null;
+        var byte_index: usize = 0;
+        var utf16_pos: usize = 0;
+        var start_byte: ?usize = null;
+        var end_byte: ?usize = null;
+
+        while (byte_index < text.len) {
+            if (start_byte == null and utf16_pos == utf16_offset) start_byte = byte_index;
+            if (end_byte == null and utf16_pos == utf16_end) {
+                end_byte = byte_index;
+                break;
+            }
+
+            const cp_len = std.unicode.utf8ByteSequenceLength(text[byte_index]) catch return null;
+            if (byte_index + cp_len > text.len) return null;
+            const cp = std.unicode.utf8Decode(text[byte_index..][0..cp_len]) catch return null;
+            utf16_pos += if (cp > 0xFFFF) 2 else 1;
+            byte_index += cp_len;
+        }
+
+        if (start_byte == null and utf16_pos == utf16_offset) start_byte = byte_index;
+        if (end_byte == null and utf16_pos == utf16_end) end_byte = byte_index;
+        if (start_byte == null or end_byte == null) return null;
+        if (end_byte.? < start_byte.?) return null;
+
+        return .{
+            .start = start_byte.?,
+            .end = end_byte.?,
+        };
+    }
+
+    fn containsMentionInEntitySet(
+        message: std.json.Value,
+        entities_key: []const u8,
+        text_key: []const u8,
+        bot_name: []const u8,
+    ) bool {
+        const entities_val = message.object.get(entities_key) orelse return false;
+        if (entities_val != .array) return false;
+
+        const text_val = message.object.get(text_key) orelse return false;
+        const text = if (text_val == .string) text_val.string else return false;
+
+        for (entities_val.array.items) |entity| {
+            if (entity != .object) continue;
+
+            const type_val = entity.object.get("type") orelse continue;
+            const entity_type = if (type_val == .string) type_val.string else continue;
+
+            if (std.mem.eql(u8, entity_type, "mention")) {
+                const offset_val = entity.object.get("offset") orelse continue;
+                const length_val = entity.object.get("length") orelse continue;
+                if (offset_val != .integer or length_val != .integer) continue;
+                if (offset_val.integer < 0 or length_val.integer <= 0) continue;
+
+                const offset: usize = @intCast(offset_val.integer);
+                const length: usize = @intCast(length_val.integer);
+                const byte_range = utf16RangeToByteRange(text, offset, length) orelse continue;
+                if (byte_range.end <= byte_range.start) continue;
+
+                const mention_with_at = text[byte_range.start..byte_range.end];
+                const mention = if (mention_with_at.len > 0 and mention_with_at[0] == '@')
+                    mention_with_at[1..]
+                else
+                    mention_with_at;
+
+                if (std.ascii.eqlIgnoreCase(mention, bot_name)) {
+                    return true;
+                }
+            }
+
+            if (std.mem.eql(u8, entity_type, "text_mention")) {
+                const user_val = entity.object.get("user") orelse continue;
+                if (user_val != .object) continue;
+                const username_val = user_val.object.get("username") orelse continue;
+                if (username_val != .string) continue;
+                if (std.ascii.eqlIgnoreCase(username_val.string, bot_name)) {
+                    return true;
+                }
+            }
+        }
+
+        return false;
+    }
+
     /// Fetch and cache the bot's username from Telegram API.
     fn fetchBotUsername(self: *TelegramChannel) void {
         if (self.bot_username != null) return;
+        if (builtin.is_test) return;
         var url_buf: [512]u8 = undefined;
         const url = self.apiUrl(&url_buf, "getMe") catch return;
         const resp = root.http_util.curlPostWithProxy(self.allocator, url, "{}", &.{}, self.proxy, "10") catch return;
@@ -642,42 +734,11 @@ pub const TelegramChannel = struct {
 
         // Ensure we have bot username cached
         self.fetchBotUsername();
-        const bot_name = self.bot_username orelse return true; // Cannot check, allow it
+        // Fail closed: if username is unavailable, do not bypass require_mention.
+        const bot_name = self.bot_username orelse return false;
 
-        // Check entities for mention
-        const entities_val = message.object.get("entities") orelse return false;
-        if (entities_val != .array) return false;
-
-        const text_val = message.object.get("text") orelse return false;
-        const text = if (text_val == .string) text_val.string else return false;
-
-        for (entities_val.array.items) |entity| {
-            if (entity != .object) continue;
-
-            const type_val = entity.object.get("type") orelse continue;
-            const entity_type = if (type_val == .string) type_val.string else continue;
-
-            // Check for mention or text_mention
-            if (std.mem.eql(u8, entity_type, "mention")) {
-                const offset_val = entity.object.get("offset") orelse continue;
-                const length_val = entity.object.get("length") orelse continue;
-
-                const offset: usize = if (offset_val == .integer) @intCast(offset_val.integer) else continue;
-                const length: usize = if (length_val == .integer) @intCast(length_val.integer) else continue;
-
-                // Extract the mentioned username (skip the @)
-                if (offset + 1 >= text.len) continue;
-                const end = @min(offset + length, text.len);
-                const mentioned = text[offset + 1 .. end];
-
-                // Case-insensitive comparison
-                if (std.ascii.eqlIgnoreCase(mentioned, bot_name)) {
-                    return true;
-                }
-            }
-        }
-
-        return false;
+        return containsMentionInEntitySet(message, "entities", "text", bot_name) or
+            containsMentionInEntitySet(message, "caption_entities", "caption", bot_name);
     }
 
     /// Register bot commands with Telegram so they appear in the "/" menu.
@@ -4170,6 +4231,56 @@ test "telegram isAuthorizedIdentity enforces group allowlist and ids" {
 
     ch.group_allow_from = &.{};
     try std.testing.expect(ch.isAuthorizedIdentity(true, "alice", null));
+}
+
+test "telegram shouldProcessMessage require_mention fails closed when username unavailable" {
+    const allocator = std.testing.allocator;
+    var ch = TelegramChannel.init(allocator, "tok", &.{}, &.{}, "allowlist");
+    defer ch.deinitPendingInteractions();
+    ch.require_mention = true;
+
+    const json =
+        \\{"chat":{"type":"group"},"text":"hello everyone","entities":[]}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, json, .{});
+    defer parsed.deinit();
+
+    try std.testing.expect(!ch.shouldProcessMessage(parsed.value));
+}
+
+test "telegram shouldProcessMessage accepts caption mention with utf16 offsets" {
+    const allocator = std.testing.allocator;
+    var ch = TelegramChannel.init(allocator, "tok", &.{}, &.{}, "allowlist");
+    defer ch.deinitPendingInteractions();
+    ch.require_mention = true;
+    ch.bot_username = try allocator.dupe(u8, "MyBot");
+    defer if (ch.bot_username) |name| allocator.free(name);
+
+    // "hi 😀 @MyBot" => mention starts at UTF-16 offset 6, length 6.
+    const json =
+        \\{"chat":{"type":"group"},"caption":"hi \ud83d\ude00 @MyBot","caption_entities":[{"type":"mention","offset":6,"length":6}]}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, json, .{});
+    defer parsed.deinit();
+
+    try std.testing.expect(ch.shouldProcessMessage(parsed.value));
+}
+
+test "telegram shouldProcessMessage accepts text_mention entity by username" {
+    const allocator = std.testing.allocator;
+    var ch = TelegramChannel.init(allocator, "tok", &.{}, &.{}, "allowlist");
+    defer ch.deinitPendingInteractions();
+    ch.require_mention = true;
+    ch.bot_username = try allocator.dupe(u8, "MyBot");
+    defer if (ch.bot_username) |name| allocator.free(name);
+
+    const json =
+        \\{"chat":{"type":"group"},"text":"ping","entities":[{"type":"text_mention","offset":0,"length":4,"user":{"id":123,"is_bot":true,"first_name":"Bot","username":"MyBot"}}]}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, json, .{});
+    defer parsed.deinit();
+
+    try std.testing.expect(ch.shouldProcessMessage(parsed.value));
 }
 
 test "telegram buildInlineKeyboardJson builds callback_data" {

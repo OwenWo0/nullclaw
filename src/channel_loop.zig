@@ -44,6 +44,60 @@ fn setScheduleToolContext(tools: []const tools_mod.Tool, chat_id: []const u8) vo
 // Parallel Message Processing
 // ════════════════════════════════════════════════════════════════════════════
 
+fn shouldSuppressGroupReply(is_group: bool, reply: []const u8) bool {
+    return is_group and std.mem.indexOf(u8, reply, "[NO_REPLY]") != null;
+}
+
+fn processTelegramMessage(
+    allocator: std.mem.Allocator,
+    runtime: *ChannelRuntime,
+    tg_ptr: *telegram.TelegramChannel,
+    session_key: []const u8,
+    content: []const u8,
+    sender: []const u8,
+    is_group: bool,
+    reply_to_id: ?i64,
+    message_sender_id: []const u8,
+) void {
+    const typing_target = sender;
+    tg_ptr.startTyping(typing_target) catch {};
+    defer tg_ptr.stopTyping(typing_target) catch {};
+
+    // Set ScheduleTool context for delivery
+    setScheduleToolContext(runtime.tools, sender);
+
+    // Build conversation context for Telegram
+    const conversation_context: ?ConversationContext = .{
+        .channel = "telegram",
+        .is_group = is_group,
+        .group_id = if (is_group) sender else null,
+    };
+
+    const reply = runtime.session_mgr.processMessage(session_key, content, conversation_context) catch |err| {
+        log.err("Agent error: {}", .{err});
+        const err_msg: []const u8 = switch (err) {
+            error.CurlFailed, error.CurlReadError, error.CurlWaitError, error.CurlWriteError => "Network error. Please try again.",
+            error.ProviderDoesNotSupportVision => "The current provider does not support image input. Switch to a vision-capable provider or remove [IMAGE:] attachments.",
+            error.NoResponseContent => "Model returned an empty response. Please retry or /new for a fresh session.",
+            error.AllProvidersFailed => "All configured providers failed for this request. Check model/provider compatibility and credentials.",
+            error.OutOfMemory => "Out of memory.",
+            else => "An error occurred. Try again or /new for a fresh session.",
+        };
+        tg_ptr.sendMessageWithReply(sender, err_msg, reply_to_id) catch |send_err| log.err("failed to send error reply: {}", .{send_err});
+        return;
+    };
+    defer allocator.free(reply);
+
+    if (shouldSuppressGroupReply(is_group, reply)) {
+        log.info("Smart reply: skipping non-essential message", .{});
+        return;
+    }
+
+    tg_ptr.sendAssistantMessageWithReply(sender, message_sender_id, is_group, reply, reply_to_id) catch |err| {
+        log.warn("Send error: {}", .{err});
+    };
+}
+
 /// Task context for processing a message in a worker thread.
 const MessageTask = struct {
     allocator: std.mem.Allocator,
@@ -55,65 +109,26 @@ const MessageTask = struct {
     message_id: ?i64,
     is_group: bool,
     reply_to_id: ?i64,
-    first_name: ?[]const u8,
     message_sender_id: []const u8,
 
     fn run(task: *MessageTask) void {
-        const allocator = task.allocator;
-
-        const typing_target = task.sender;
-        task.tg_ptr.startTyping(typing_target) catch {};
-        defer task.tg_ptr.stopTyping(typing_target) catch {};
-
-        // Set ScheduleTool context for delivery
-        setScheduleToolContext(task.runtime.tools, task.sender);
-
-        // Build conversation context for Telegram
-        const conversation_context: ?ConversationContext = .{
-            .channel = "telegram",
-            .is_group = task.is_group,
-            .group_id = if (task.is_group) task.sender else null,
-        };
-
-        const reply = task.runtime.session_mgr.processMessage(task.session_key, task.content, conversation_context) catch |err| {
-            log.err("Agent error in worker thread: {}", .{err});
-            const err_msg: []const u8 = switch (err) {
-                error.CurlFailed, error.CurlReadError, error.CurlWaitError, error.CurlWriteError => "Network error. Please try again.",
-                error.ProviderDoesNotSupportVision => "The current provider does not support image input. Switch to a vision-capable provider or remove [IMAGE:] attachments.",
-                error.NoResponseContent => "Model returned an empty response. Please retry or /new for a fresh session.",
-                error.AllProvidersFailed => "All configured providers failed for this request. Check model/provider compatibility and credentials.",
-                error.OutOfMemory => "Out of memory.",
-                else => "An error occurred. Try again or /new for a fresh session.",
-            };
-            task.tg_ptr.sendMessageWithReply(task.sender, err_msg, task.reply_to_id) catch |send_err| log.err("failed to send error reply: {}", .{send_err});
-            return;
-        };
-        defer allocator.free(reply);
-
-        // Smart reply: if require_mention is false and in group, check for [NO_REPLY]
-        const should_send = blk: {
-            if (!task.tg_ptr.require_mention and task.is_group) {
-                // Check if AI decided not to reply
-                if (std.mem.indexOf(u8, reply, "[NO_REPLY]") != null) {
-                    log.info("Smart reply: skipping non-essential message", .{});
-                    break :blk false;
-                }
-            }
-            break :blk true;
-        };
-
-        if (should_send) {
-            task.tg_ptr.sendAssistantMessageWithReply(task.sender, task.message_sender_id, task.is_group, reply, task.reply_to_id) catch |err| {
-                log.warn("Send error in worker thread: {}", .{err});
-            };
-        }
+        processTelegramMessage(
+            task.allocator,
+            task.runtime,
+            task.tg_ptr,
+            task.session_key,
+            task.content,
+            task.sender,
+            task.is_group,
+            task.reply_to_id,
+            task.message_sender_id,
+        );
     }
 
     fn deinit(self: *MessageTask) void {
         self.allocator.free(self.session_key);
         self.allocator.free(self.content);
         self.allocator.free(self.sender);
-        if (self.first_name) |name| self.allocator.free(name);
         self.allocator.free(self.message_sender_id);
     }
 };
@@ -504,10 +519,19 @@ pub fn runTelegramLoop(
     loop_state.last_activity.store(std.time.timestamp(), .release);
 
     // Parallel worker bookkeeping.
-    var worker_threads: std.ArrayListUnmanaged(std.Thread) = .empty;
+    // Keep at most one in-flight worker per session_key to preserve order.
+    var active_worker_threads: std.StringHashMapUnmanaged(std.Thread) = .empty;
+    var active_worker_order: std.ArrayListUnmanaged([]const u8) = .empty;
     defer {
-        for (worker_threads.items) |thread| thread.join();
-        worker_threads.deinit(allocator);
+        while (active_worker_order.items.len > 0) {
+            const key = active_worker_order.orderedRemove(0);
+            if (active_worker_threads.fetchRemove(key)) |entry| {
+                entry.value.join();
+                allocator.free(@constCast(entry.key));
+            }
+        }
+        active_worker_order.deinit(allocator);
+        active_worker_threads.deinit(allocator);
     }
 
     const max_parallel_tasks: usize = if (config.session.max_concurrent_tasks > 1)
@@ -558,122 +582,129 @@ pub fn runTelegramLoop(
             };
 
             if (enable_parallel) {
-                // Bound parallelism per channel loop instance.
-                while (worker_threads.items.len >= max_parallel_tasks) {
-                    const oldest = worker_threads.orderedRemove(0);
-                    oldest.join();
-                }
+                var handled_in_worker = false;
+                parallel_attempt: {
+                    // Preserve message order per session_key.
+                    if (active_worker_threads.fetchRemove(session_key)) |entry| {
+                        var idx: usize = 0;
+                        while (idx < active_worker_order.items.len) : (idx += 1) {
+                            if (std.mem.eql(u8, active_worker_order.items[idx], session_key)) {
+                                _ = active_worker_order.orderedRemove(idx);
+                                break;
+                            }
+                        }
+                        entry.value.join();
+                        allocator.free(@constCast(entry.key));
+                    }
 
-                // Spawn a worker thread for this message.
-                // Each session is still serialized via Session.mutex inside processMessage.
-                const task = allocator.create(MessageTask) catch |err| {
-                    log.err("Failed to allocate task: {}", .{err});
-                    continue;
-                };
-
-                // Duplicate strings for task ownership
-                const task_session_key = allocator.dupe(u8, session_key) catch |err| {
-                    log.err("Failed to duplicate session key: {}, falling back to synchronous", .{err});
-                    allocator.destroy(task);
-                    continue;
-                };
-                const task_content = allocator.dupe(u8, msg.content) catch |err| {
-                    log.err("Failed to duplicate content: {}, falling back to synchronous", .{err});
-                    allocator.free(task_session_key);
-                    allocator.destroy(task);
-                    continue;
-                };
-                const task_sender = allocator.dupe(u8, msg.sender) catch |err| {
-                    log.err("Failed to duplicate sender: {}, falling back to synchronous", .{err});
-                    allocator.free(task_session_key);
-                    allocator.free(task_content);
-                    allocator.destroy(task);
-                    continue;
-                };
-                const task_first_name = if (msg.first_name) |fnm| allocator.dupe(u8, fnm) catch null else null;
-                const task_message_sender_id = allocator.dupe(u8, msg.id) catch |err| {
-                    log.err("Failed to duplicate message id: {}, falling back to synchronous", .{err});
-                    allocator.free(task_session_key);
-                    allocator.free(task_content);
-                    allocator.free(task_sender);
-                    if (task_first_name) |n| allocator.free(n);
-                    allocator.destroy(task);
-                    continue;
-                };
-
-                task.* = .{
-                    .allocator = allocator,
-                    .runtime = runtime,
-                    .tg_ptr = tg_ptr,
-                    .session_key = task_session_key,
-                    .content = task_content,
-                    .sender = task_sender,
-                    .message_id = msg.message_id,
-                    .is_group = msg.is_group,
-                    .reply_to_id = reply_to_id,
-                    .first_name = task_first_name,
-                    .message_sender_id = task_message_sender_id,
-                };
-
-                const thread = std.Thread.spawn(.{}, messageTaskWorker, .{task}) catch |err| {
-                    log.err("Failed to spawn worker thread: {}", .{err});
-                    task.deinit();
-                    allocator.destroy(task);
-                    continue;
-                };
-                worker_threads.append(allocator, thread) catch {
-                    // Cannot track thread handle; join immediately to avoid runaway.
-                    thread.join();
-                };
-            } else {
-                // Synchronous processing (original behavior)
-                const typing_target = msg.sender;
-                tg_ptr.startTyping(typing_target) catch {};
-                defer tg_ptr.stopTyping(typing_target) catch {};
-
-                // Set ScheduleTool context for delivery
-                setScheduleToolContext(runtime.tools, msg.sender);
-
-                // Build conversation context for Telegram
-                const conversation_context: ?ConversationContext = .{
-                    .channel = "telegram",
-                    .is_group = msg.is_group,
-                    .group_id = if (msg.is_group) msg.sender else null,
-                };
-
-                const reply = runtime.session_mgr.processMessage(session_key, msg.content, conversation_context) catch |err| {
-                    log.err("Agent error: {}", .{err});
-                    const err_msg: []const u8 = switch (err) {
-                        error.CurlFailed, error.CurlReadError, error.CurlWaitError, error.CurlWriteError => "Network error. Please try again.",
-                        error.ProviderDoesNotSupportVision => "The current provider does not support image input. Switch to a vision-capable provider or remove [IMAGE:] attachments.",
-                        error.NoResponseContent => "Model returned an empty response. Please retry or /new for a fresh session.",
-                        error.AllProvidersFailed => "All configured providers failed for this request. Check model/provider compatibility and credentials.",
-                        error.OutOfMemory => "Out of memory.",
-                        else => "An error occurred. Try again or /new for a fresh session.",
-                    };
-                    tg_ptr.sendMessageWithReply(msg.sender, err_msg, reply_to_id) catch |send_err| log.err("failed to send error reply: {}", .{send_err});
-                    continue;
-                };
-                defer allocator.free(reply);
-
-                // Smart reply: if require_mention is false and in group, check for [NO_REPLY]
-                const should_send = blk: {
-                    if (!tg_ptr.require_mention and msg.is_group) {
-                        // Check if AI decided not to reply
-                        if (std.mem.indexOf(u8, reply, "[NO_REPLY]") != null) {
-                            log.info("Smart reply: skipping non-essential message", .{});
-                            break :blk false;
+                    // Bound total parallelism per channel loop instance.
+                    while (active_worker_order.items.len >= max_parallel_tasks) {
+                        const oldest_key = active_worker_order.orderedRemove(0);
+                        if (active_worker_threads.fetchRemove(oldest_key)) |entry| {
+                            entry.value.join();
+                            allocator.free(@constCast(entry.key));
                         }
                     }
-                    break :blk true;
-                };
 
-                if (should_send) {
-                    tg_ptr.sendAssistantMessageWithReply(msg.sender, msg.id, msg.is_group, reply, reply_to_id) catch |err| {
-                        log.warn("Send error: {}", .{err});
+                    // Spawn a worker thread for this message.
+                    const task = allocator.create(MessageTask) catch |err| {
+                        log.err("Failed to allocate task: {}, falling back to synchronous", .{err});
+                        break :parallel_attempt;
                     };
+
+                    const task_session_key = allocator.dupe(u8, session_key) catch |err| {
+                        log.err("Failed to duplicate session key: {}, falling back to synchronous", .{err});
+                        allocator.destroy(task);
+                        break :parallel_attempt;
+                    };
+                    const task_content = allocator.dupe(u8, msg.content) catch |err| {
+                        log.err("Failed to duplicate content: {}, falling back to synchronous", .{err});
+                        allocator.free(task_session_key);
+                        allocator.destroy(task);
+                        break :parallel_attempt;
+                    };
+                    const task_sender = allocator.dupe(u8, msg.sender) catch |err| {
+                        log.err("Failed to duplicate sender: {}, falling back to synchronous", .{err});
+                        allocator.free(task_session_key);
+                        allocator.free(task_content);
+                        allocator.destroy(task);
+                        break :parallel_attempt;
+                    };
+                    const task_message_sender_id = allocator.dupe(u8, msg.id) catch |err| {
+                        log.err("Failed to duplicate message id: {}, falling back to synchronous", .{err});
+                        allocator.free(task_session_key);
+                        allocator.free(task_content);
+                        allocator.free(task_sender);
+                        allocator.destroy(task);
+                        break :parallel_attempt;
+                    };
+
+                    task.* = .{
+                        .allocator = allocator,
+                        .runtime = runtime,
+                        .tg_ptr = tg_ptr,
+                        .session_key = task_session_key,
+                        .content = task_content,
+                        .sender = task_sender,
+                        .message_id = msg.message_id,
+                        .is_group = msg.is_group,
+                        .reply_to_id = reply_to_id,
+                        .message_sender_id = task_message_sender_id,
+                    };
+
+                    const thread = std.Thread.spawn(.{}, messageTaskWorker, .{task}) catch |err| {
+                        log.err("Failed to spawn worker thread: {}, falling back to synchronous", .{err});
+                        task.deinit();
+                        allocator.destroy(task);
+                        break :parallel_attempt;
+                    };
+
+                    const tracked_session_key = allocator.dupe(u8, session_key) catch |err| {
+                        log.err("Failed to duplicate tracking session key: {}", .{err});
+                        thread.join();
+                        handled_in_worker = true;
+                        break :parallel_attempt;
+                    };
+
+                    active_worker_threads.put(allocator, tracked_session_key, thread) catch |err| {
+                        log.err("Failed to register worker thread: {}", .{err});
+                        thread.join();
+                        allocator.free(tracked_session_key);
+                        handled_in_worker = true;
+                        break :parallel_attempt;
+                    };
+
+                    active_worker_order.append(allocator, tracked_session_key) catch |err| {
+                        log.err("Failed to enqueue worker thread: {}", .{err});
+                        if (active_worker_threads.fetchRemove(tracked_session_key)) |entry| {
+                            entry.value.join();
+                            allocator.free(@constCast(entry.key));
+                        } else {
+                            thread.join();
+                            allocator.free(tracked_session_key);
+                        }
+                        handled_in_worker = true;
+                        break :parallel_attempt;
+                    };
+
+                    handled_in_worker = true;
                 }
+
+                if (handled_in_worker) continue;
             }
+
+            // Synchronous processing
+            processTelegramMessage(
+                allocator,
+                runtime,
+                tg_ptr,
+                session_key,
+                msg.content,
+                msg.sender,
+                msg.is_group,
+                reply_to_id,
+                msg.id,
+            );
         }
 
         if (messages.len > 0) {
@@ -1059,6 +1090,12 @@ test "TelegramLoopState last_activity update" {
     state.last_activity.store(std.time.timestamp(), .release);
     const after = state.last_activity.load(.acquire);
     try std.testing.expect(after >= before);
+}
+
+test "shouldSuppressGroupReply suppresses only group replies with marker" {
+    try std.testing.expect(shouldSuppressGroupReply(true, "ok [NO_REPLY]"));
+    try std.testing.expect(!shouldSuppressGroupReply(false, "ok [NO_REPLY]"));
+    try std.testing.expect(!shouldSuppressGroupReply(true, "regular reply"));
 }
 
 test "ProviderHolder tagged union fields" {
