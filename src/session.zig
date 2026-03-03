@@ -25,7 +25,7 @@ const SecurityPolicy = @import("security/policy.zig").SecurityPolicy;
 const streaming = @import("streaming.zig");
 const log = std.log.scoped(.session);
 const MESSAGE_LOG_MAX_BYTES: usize = 4096;
-const USAGE_LEDGER_FILENAME = "llm_usage.jsonl";
+const TOKEN_USAGE_LEDGER_FILENAME = "llm_token_usage.jsonl";
 
 fn messageLogPreview(text: []const u8) struct { slice: []const u8, truncated: bool } {
     if (text.len <= MESSAGE_LOG_MAX_BYTES) {
@@ -139,8 +139,10 @@ pub const SessionManager = struct {
         agent.response_cache = self.response_cache;
         agent.mem_rt = self.mem_rt;
         agent.memory_session_id = owned_key;
-        agent.usage_record_callback = usageRecordForwarder;
-        agent.usage_record_ctx = @ptrCast(self);
+        if (self.config.diagnostics.token_usage_ledger_enabled) {
+            agent.usage_record_callback = usageRecordForwarder;
+            agent.usage_record_ctx = @ptrCast(self);
+        }
 
         session.* = .{
             .agent = agent,
@@ -207,8 +209,9 @@ pub const SessionManager = struct {
     }
 
     fn usageLedgerPath(self: *SessionManager) ?[]u8 {
+        if (!self.config.diagnostics.token_usage_ledger_enabled) return null;
         const config_dir = std.fs.path.dirname(self.config.config_path) orelse return null;
-        return std.fs.path.join(self.allocator, &.{ config_dir, USAGE_LEDGER_FILENAME }) catch null;
+        return std.fs.path.join(self.allocator, &.{ config_dir, TOKEN_USAGE_LEDGER_FILENAME }) catch null;
     }
 
     fn appendUsageRecord(self: *SessionManager, record: Agent.UsageRecord) void {
@@ -230,7 +233,7 @@ pub const SessionManager = struct {
         var file_writer = file.writer(&writer_buf);
         const w = &file_writer.interface;
         w.print(
-            "{{\"ts\":{d},\"provider\":{f},\"model\":{f},\"prompt_tokens\":{d},\"completion_tokens\":{d},\"total_tokens\":{d},\"success\":{}}}\n",
+            "{{\"ts\":{d},\"provider\":{f},\"model\":{f},\"prompt_tokens\":{d},\"completion_tokens\":{d},\"total_tokens\":{d}}}\n",
             .{
                 record.ts,
                 std.json.fmt(record.provider, .{}),
@@ -238,7 +241,6 @@ pub const SessionManager = struct {
                 record.usage.prompt_tokens,
                 record.usage.completion_tokens,
                 record.usage.total_tokens,
-                record.success,
             },
         ) catch return;
         w.flush() catch {};

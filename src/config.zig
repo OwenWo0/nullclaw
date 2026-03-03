@@ -685,6 +685,7 @@ pub const Config = struct {
         try w.print(",\n    \"log_message_receipts\": {s}", .{if (self.diagnostics.log_message_receipts) "true" else "false"});
         try w.print(",\n    \"log_message_payloads\": {s}", .{if (self.diagnostics.log_message_payloads) "true" else "false"});
         try w.print(",\n    \"log_llm_io\": {s}", .{if (self.diagnostics.log_llm_io) "true" else "false"});
+        try w.print(",\n    \"token_usage_ledger_enabled\": {s}", .{if (self.diagnostics.token_usage_ledger_enabled) "true" else "false"});
         if (self.diagnostics.otel_endpoint != null or self.diagnostics.otel_service_name != null) {
             try w.print(",\n    \"otel\": {{", .{});
             var otel_first = true;
@@ -1333,6 +1334,7 @@ test "save roundtrip preserves diagnostics logging flags" {
     cfg.diagnostics.log_message_receipts = true;
     cfg.diagnostics.log_message_payloads = true;
     cfg.diagnostics.log_llm_io = true;
+    cfg.diagnostics.token_usage_ledger_enabled = false;
     try cfg.save();
 
     const file = try std.fs.openFileAbsolute(config_path, .{});
@@ -1353,6 +1355,7 @@ test "save roundtrip preserves diagnostics logging flags" {
     try std.testing.expect(loaded.diagnostics.log_message_receipts);
     try std.testing.expect(loaded.diagnostics.log_message_payloads);
     try std.testing.expect(loaded.diagnostics.log_llm_io);
+    try std.testing.expect(!loaded.diagnostics.token_usage_ledger_enabled);
 }
 
 test "save roundtrip preserves reliability settings" {
@@ -2207,7 +2210,7 @@ test "validation rejects relay ttl values outside supported ranges" {
 test "json parse diagnostics section" {
     const allocator = std.testing.allocator;
     const json =
-        \\{"diagnostics": {"backend": "otel", "log_tool_calls": true, "log_message_receipts": true, "log_message_payloads": true, "log_llm_io": true, "otel": {"endpoint": "http://localhost:4318", "service_name": "yc"}}}
+        \\{"diagnostics": {"backend": "otel", "log_tool_calls": true, "log_message_receipts": true, "log_message_payloads": true, "log_llm_io": true, "token_usage_ledger_enabled": false, "otel": {"endpoint": "http://localhost:4318", "service_name": "yc"}}}
     ;
     var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
     try cfg.parseJson(json);
@@ -2216,6 +2219,7 @@ test "json parse diagnostics section" {
     try std.testing.expect(cfg.diagnostics.log_message_receipts);
     try std.testing.expect(cfg.diagnostics.log_message_payloads);
     try std.testing.expect(cfg.diagnostics.log_llm_io);
+    try std.testing.expect(!cfg.diagnostics.token_usage_ledger_enabled);
     try std.testing.expectEqualStrings("http://localhost:4318", cfg.diagnostics.otel_endpoint.?);
     try std.testing.expectEqualStrings("yc", cfg.diagnostics.otel_service_name.?);
     allocator.free(cfg.diagnostics.backend);

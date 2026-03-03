@@ -74,6 +74,9 @@ pub const DiagnosticsConfig = struct {
     /// Emit request/response payloads around provider chat calls.
     /// Intended for local debugging only (can include sensitive text).
     log_llm_io: bool = false,
+    /// Persist per-response token counters to a JSONL ledger near config.json.
+    /// This stores token counts only (provider/model/prompt/completion/total), not message text.
+    token_usage_ledger_enabled: bool = true,
 };
 
 pub const AutonomyConfig = struct {
