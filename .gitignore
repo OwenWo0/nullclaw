@@ -25,3 +25,8 @@ config.signal.json
 .cursor/
 .trae/
 .codebuddy/
+output/
+*.tar.xz
+config.private.json
+output/
+*.tar.xz
