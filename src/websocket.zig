@@ -195,6 +195,219 @@ pub const WsClient = struct {
         };
     }
 
+    /// Parsed HTTP/HTTPS/SOCKS5 proxy URL components.
+    pub const ProxyConfig = struct {
+        host: []const u8,
+        port: u16,
+    };
+
+    /// Parse a proxy URL like "http://host:port" or "http://host:port/" into host+port.
+    /// Returns null if the URL is malformed or uses an unsupported scheme.
+    /// The returned host slice points into the original `url` memory.
+    pub fn parseProxyUrl(url: []const u8) ?ProxyConfig {
+        // Strip scheme
+        const no_scheme = if (std.mem.startsWith(u8, url, "http://"))
+            url["http://".len..]
+        else if (std.mem.startsWith(u8, url, "https://"))
+            url["https://".len..]
+        else
+            return null;
+
+        if (no_scheme.len == 0) return null;
+
+        // Strip path/query if present
+        const authority = if (std.mem.indexOfAny(u8, no_scheme, "/?#")) |idx|
+            no_scheme[0..idx]
+        else
+            no_scheme;
+
+        if (authority.len == 0) return null;
+
+        // Split host:port
+        const colon_pos = std.mem.lastIndexOf(u8, authority, ":") orelse return null;
+        const host = authority[0..colon_pos];
+        if (host.len == 0) return null;
+
+        const port_str = authority[colon_pos + 1 ..];
+        const port = std.fmt.parseInt(u16, port_str, 10) catch return null;
+
+        return .{ .host = host, .port = port };
+    }
+
+    /// Connect to wss://host:port/path via an HTTP CONNECT proxy tunnel.
+    /// The proxy receives a plaintext CONNECT request; TLS is established end-to-end
+    /// through the tunnel so the proxy only sees encrypted traffic.
+    pub fn connectViaProxy(
+        allocator: std.mem.Allocator,
+        host: []const u8,
+        port: u16,
+        path: []const u8,
+        extra_headers: []const []const u8,
+        proxy: ProxyConfig,
+    ) !WsClient {
+        // 1. TCP connect to proxy
+        const proxy_addrs = try std.net.getAddressList(allocator, proxy.host, proxy.port);
+        defer proxy_addrs.deinit();
+        if (proxy_addrs.addrs.len == 0) return error.DnsResolutionFailed;
+        const stream = try std.net.tcpConnectToAddress(proxy_addrs.addrs[0]);
+        errdefer stream.close();
+
+        // 2. Send HTTP CONNECT request (plaintext, before TLS)
+        var connect_buf: [512]u8 = undefined;
+        var connect_fbs = std.io.fixedBufferStream(&connect_buf);
+        const cw = connect_fbs.writer();
+        try cw.print("CONNECT {s}:{d} HTTP/1.1\r\n", .{ host, port });
+        try cw.print("Host: {s}:{d}\r\n", .{ host, port });
+        try cw.writeAll("\r\n");
+        const connect_req = connect_fbs.getWritten();
+
+        // Write CONNECT request via raw TCP (no TLS yet)
+        var total_written: usize = 0;
+        while (total_written < connect_req.len) {
+            total_written += stream.write(connect_req[total_written..]) catch return error.ProxyConnectFailed;
+        }
+
+        // 3. Read proxy response (expect "HTTP/1.1 200" or "HTTP/1.0 200")
+        var proxy_resp: [4096]u8 = undefined;
+        var proxy_resp_len: usize = 0;
+        while (proxy_resp_len < proxy_resp.len) {
+            const n = stream.read(proxy_resp[proxy_resp_len .. proxy_resp_len + 1]) catch return error.ProxyConnectFailed;
+            if (n == 0) return error.ProxyConnectFailed;
+            proxy_resp_len += n;
+            // Check for end-of-headers
+            if (proxy_resp_len >= 4 and
+                proxy_resp[proxy_resp_len - 4] == '\r' and
+                proxy_resp[proxy_resp_len - 3] == '\n' and
+                proxy_resp[proxy_resp_len - 2] == '\r' and
+                proxy_resp[proxy_resp_len - 1] == '\n')
+            {
+                break;
+            }
+        }
+
+        const proxy_resp_str = proxy_resp[0..proxy_resp_len];
+        // Accept HTTP/1.0 200 and HTTP/1.1 200
+        if (!std.mem.startsWith(u8, proxy_resp_str, "HTTP/1.1 200") and
+            !std.mem.startsWith(u8, proxy_resp_str, "HTTP/1.0 200"))
+        {
+            log.err("WS proxy CONNECT failed: {s}", .{proxy_resp_str[0..@min(proxy_resp_len, 80)]});
+            return error.ProxyConnectFailed;
+        }
+
+        log.info("WS proxy CONNECT tunnel established to {s}:{d}", .{ host, port });
+
+        // 4. TCP stream is now tunneled — proceed with TLS + WS upgrade (same as connect)
+        const tls_buf_len = std.crypto.tls.Client.min_buffer_len;
+        const read_buf = try allocator.alloc(u8, tls_buf_len);
+        errdefer allocator.free(read_buf);
+        const write_buf = try allocator.alloc(u8, tls_buf_len);
+        errdefer allocator.free(write_buf);
+        const tls_read_buf = try allocator.alloc(u8, tls_buf_len);
+        errdefer allocator.free(tls_read_buf);
+        const tls_write_buf = try allocator.alloc(u8, tls_buf_len);
+        errdefer allocator.free(tls_write_buf);
+
+        const tls_state = try allocator.create(TlsState);
+        errdefer allocator.destroy(tls_state);
+
+        tls_state.read_buf = read_buf;
+        tls_state.write_buf = write_buf;
+        tls_state.tls_read_buf = tls_read_buf;
+        tls_state.tls_write_buf = tls_write_buf;
+        tls_state.stream_reader = stream.reader(read_buf);
+        tls_state.stream_writer = stream.writer(write_buf);
+
+        var ca_bundle = std.crypto.Certificate.Bundle{};
+        var has_ca_bundle = false;
+        if (ca_bundle.rescan(allocator)) |_| {
+            has_ca_bundle = true;
+        } else |err| {
+            log.warn("WS TLS (proxy): system CA bundle unavailable, fallback to no verification: {}", .{err});
+        }
+        defer if (has_ca_bundle) ca_bundle.deinit(allocator);
+
+        const tls_options: std.crypto.tls.Client.Options = .{
+            .host = .{ .explicit = host },
+            .ca = if (has_ca_bundle) .{ .bundle = ca_bundle } else .no_verification,
+            .read_buffer = tls_read_buf,
+            .write_buffer = tls_write_buf,
+            .allow_truncation_attacks = true,
+        };
+
+        tls_state.tls_client = std.crypto.tls.Client.init(
+            tls_state.stream_reader.interface(),
+            &tls_state.stream_writer.interface,
+            tls_options,
+        ) catch return error.TlsInitializationFailed;
+
+        // WebSocket upgrade handshake (over TLS, through the tunnel)
+        var key_raw: [16]u8 = undefined;
+        std.crypto.random.bytes(&key_raw);
+        var key_b64: [24]u8 = undefined;
+        _ = std.base64.standard.Encoder.encode(&key_b64, &key_raw);
+
+        var req_buf: [4096]u8 = undefined;
+        var req_fbs = std.io.fixedBufferStream(&req_buf);
+        const rw = req_fbs.writer();
+        try rw.print("GET {s} HTTP/1.1\r\n", .{path});
+        try rw.print("Host: {s}\r\n", .{host});
+        try rw.writeAll("Upgrade: websocket\r\n");
+        try rw.writeAll("Connection: Upgrade\r\n");
+        try rw.print("Sec-WebSocket-Key: {s}\r\n", .{key_b64});
+        try rw.writeAll("Sec-WebSocket-Version: 13\r\n");
+        for (extra_headers) |hdr| {
+            try rw.print("{s}\r\n", .{hdr});
+        }
+        try rw.writeAll("\r\n");
+        const req = req_fbs.getWritten();
+
+        try tls_state.tls_client.writer.writeAll(req);
+        try tls_state.tls_client.writer.flush();
+        try tls_state.stream_writer.interface.flush();
+
+        // Read HTTP 101 response
+        var resp_buf: [4096]u8 = undefined;
+        var resp_len: usize = 0;
+        var headers_complete = false;
+        while (resp_len < resp_buf.len) {
+            const byte_ptr = tls_state.tls_client.reader.take(1) catch
+                return error.WsHandshakeFailed;
+            resp_buf[resp_len] = byte_ptr[0];
+            resp_len += 1;
+            if (resp_len >= 4 and
+                resp_buf[resp_len - 4] == '\r' and
+                resp_buf[resp_len - 3] == '\n' and
+                resp_buf[resp_len - 2] == '\r' and
+                resp_buf[resp_len - 1] == '\n')
+            {
+                headers_complete = true;
+                break;
+            }
+        }
+        if (!headers_complete) {
+            log.err("WS handshake (proxy): header block exceeded {d} bytes", .{resp_buf.len});
+            return error.WsHandshakeFailed;
+        }
+        const resp = resp_buf[0..resp_len];
+        if (!std.mem.startsWith(u8, resp, "HTTP/1.1 101")) {
+            log.err("WS handshake (proxy): unexpected response: {s}", .{resp[0..@min(resp_len, 80)]});
+            return error.WsHandshakeFailed;
+        }
+
+        const expected = computeAcceptKey(&key_b64);
+        if (std.mem.indexOf(u8, resp, &expected) == null) {
+            log.err("WS handshake (proxy): invalid Sec-WebSocket-Accept", .{});
+            return error.WsHandshakeFailed;
+        }
+
+        return WsClient{
+            .allocator = allocator,
+            .stream = stream,
+            .tls = tls_state,
+            .write_mu = .{},
+        };
+    }
+
     /// Compute expected Sec-WebSocket-Accept: base64(SHA1(key_b64 + WS_MAGIC)).
     pub fn computeAcceptKey(key_b64: []const u8) [28]u8 {
         var sha1 = std.crypto.hash.Sha1.init(.{});
@@ -757,4 +970,42 @@ test "ws buildFrame zero-len payload close" {
     try std.testing.expectEqual(@as(usize, 6), n); // 2 header + 4 mask
     try std.testing.expectEqual(@as(u8, 0x88), buf[0]); // close
     try std.testing.expectEqual(@as(u8, 0x80), buf[1]); // MASK=1, len=0
+}
+
+test "ws parseProxyUrl valid http" {
+    const p = WsClient.parseProxyUrl("http://127.0.0.1:8080").?;
+    try std.testing.expectEqualStrings("127.0.0.1", p.host);
+    try std.testing.expectEqual(@as(u16, 8080), p.port);
+}
+
+test "ws parseProxyUrl valid https" {
+    const p = WsClient.parseProxyUrl("https://proxy.example.com:3128").?;
+    try std.testing.expectEqualStrings("proxy.example.com", p.host);
+    try std.testing.expectEqual(@as(u16, 3128), p.port);
+}
+
+test "ws parseProxyUrl with trailing slash" {
+    const p = WsClient.parseProxyUrl("http://10.0.0.1:6152/").?;
+    try std.testing.expectEqualStrings("10.0.0.1", p.host);
+    try std.testing.expectEqual(@as(u16, 6152), p.port);
+}
+
+test "ws parseProxyUrl missing port returns null" {
+    try std.testing.expect(WsClient.parseProxyUrl("http://proxy.example.com") == null);
+}
+
+test "ws parseProxyUrl unsupported scheme returns null" {
+    try std.testing.expect(WsClient.parseProxyUrl("socks5://127.0.0.1:1080") == null);
+}
+
+test "ws parseProxyUrl empty string returns null" {
+    try std.testing.expect(WsClient.parseProxyUrl("") == null);
+}
+
+test "ws parseProxyUrl no scheme returns null" {
+    try std.testing.expect(WsClient.parseProxyUrl("127.0.0.1:8080") == null);
+}
+
+test "ws parseProxyUrl empty host returns null" {
+    try std.testing.expect(WsClient.parseProxyUrl("http://:8080") == null);
 }

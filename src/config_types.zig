@@ -254,6 +254,8 @@ pub const DiscordConfig = struct {
     allow_from: []const []const u8 = &.{},
     require_mention: bool = false,
     intents: u32 = 37377, // GUILDS|GUILD_MESSAGES|MESSAGE_CONTENT|DIRECT_MESSAGES
+    /// Optional HTTP proxy URL for WebSocket gateway connection (e.g. "http://host:port").
+    proxy: ?[]const u8 = null,
 };
 
 pub const SlackReceiveMode = enum {

@@ -21,6 +21,7 @@ pub const DiscordChannel = struct {
     allow_from: []const []const u8 = &.{},
     require_mention: bool = false,
     intents: u32 = 37377, // GUILDS|GUILD_MESSAGES|MESSAGE_CONTENT|DIRECT_MESSAGES
+    proxy: ?[]const u8 = null,
     bus: ?*bus_mod.Bus = null,
 
     typing_mu: std.Thread.Mutex = .{},
@@ -84,6 +85,7 @@ pub const DiscordChannel = struct {
             .allow_from = cfg.allow_from,
             .require_mention = cfg.require_mention,
             .intents = cfg.intents,
+            .proxy = cfg.proxy,
         };
     }
 
@@ -450,7 +452,20 @@ pub const DiscordChannel = struct {
         const default_host = "gateway.discord.gg";
         const host: []const u8 = if (self.resume_gateway_url) |u| parseGatewayHost(u) else default_host;
 
-        var ws = try websocket.WsClient.connect(
+        var ws = if (self.proxy) |proxy_url| blk: {
+            const proxy_cfg = websocket.WsClient.parseProxyUrl(proxy_url) orelse {
+                log.err("Discord: invalid proxy URL: {s}", .{proxy_url});
+                return error.InvalidProxyUrl;
+            };
+            break :blk try websocket.WsClient.connectViaProxy(
+                self.allocator,
+                host,
+                443,
+                "/?v=10&encoding=json",
+                &.{},
+                proxy_cfg,
+            );
+        } else try websocket.WsClient.connect(
             self.allocator,
             host,
             443,
